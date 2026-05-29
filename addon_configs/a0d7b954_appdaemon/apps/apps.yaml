@@ -1,0 +1,9 @@
+hello_world:
+  module: hello
+  class: HelloWorld
+
+utilityapi_import:
+  module: utilityapi_import
+  class: UtilityAPIDataImporter
+  ha_url: "https://homeassistant.local/"  # Update with your Home Assistant URL
+  token: PLACEHOLDER # Update with your own HA long access token
