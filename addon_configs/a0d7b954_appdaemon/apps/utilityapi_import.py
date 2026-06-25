@@ -30,10 +30,16 @@
 # 2026/05/28 - PY - correctly extract and accumulate ALL available API data intervals instead of just the first
 # 2026/05/28 - PY - refactor to automatically create new device + child sensor(s) via MQTT discovery
 # 2026/05/28 - PY - refactor to extensibly support additional child sensors via SENSORS_CONFIG dictionary
+# 2026/06/25 - PY - change state_class of "net_energy" and "fwd_energy" sensors from "measurement" to "total"
+# 2026/06/25 - PY - insert_statistics() uses split arch to write stats to dedicated database and prevent live-state updates from causing ghost negative spikes in energy dashboard
+# 2026/06/25 - PY - update SCRIPT_VERSION to "2.0"
+# 2026/06/25 - PY - at startup, block until HA/MQTT finishes initializing before proceeding with syncs
+# 2026/06/25 - PY - update SCRIPT_VERSION to "2.1"
 
 import json
 import requests
 import websocket
+import threading
 from datetime import datetime, timedelta, UTC
 from zoneinfo import ZoneInfo
 import appdaemon.plugins.hass.hassapi as hass
@@ -43,12 +49,13 @@ ACCESS_TOKEN = "PLACEHOLDER" # Update to access token from UtilityAPI
 METER_ID = "PLACEHOLDER" # Update to meter ID from UtilityAPI
 
 # Home Assistant configuration
-HA_URL = "ws://homeassistant.local:1234/api/websocket"  # Update to your HA WebSocket URL
+HA_URL = "ws://ha.pyiu.ddnsfree.com:8123/api/websocket"  # Update to your HA WebSocket URL
 
-SCRIPT_VERSION = "1.0"
+SCRIPT_VERSION = "2.1"
 MAX_DAYS = 365
 LAST_TIME_ATTR_STR = "last_fetched_interval"
 
+EXTERNAL_STAT_PREFIX = "utilityapi"
 SENSORS_CONFIG = {
     "net_energy": {
         "name": "Energy Usage (Net)",
@@ -58,7 +65,7 @@ SENSORS_CONFIG = {
         "discovery_topic": "homeassistant/sensor/eversource_usage/net_energy/config",
         "unit": "kWh",
         "device_class": "energy",
-        "state_class": "measurement",
+        "state_class": "total",
         "datapoint_type": "net"  # Extracts 'net' type from JSON
     },
     "fwd_energy": {
@@ -69,7 +76,7 @@ SENSORS_CONFIG = {
         "discovery_topic": "homeassistant/sensor/eversource_usage/fwd_energy/config",
         "unit": "kWh",
         "device_class": "energy",
-        "state_class": "measurement",
+        "state_class": "total",
         "datapoint_type": "fwd"  # Extracts 'fwd' type from JSON
     },
     # DISABLE peak_demand. It's not useful because API updates come only once per day and only the last value from that pull can be shown.
@@ -110,14 +117,41 @@ SENSORS_CONFIG = {
 
 class UtilityAPIDataImporter(hass.Hass):
     def initialize(self):
-        # 1. Setup MQTT Discovery via HA Core to create the Device and Sensor in EMQX
-        self.setup_mqtt_device()
+        # Start background boot worker thread to block until HA/MQTT has finished initializing (e.g. after rebooting).
+        # Background thread allows bypassing AppDaemon's 10-second thread lifetime limit.
+        threading.Thread(target=self.initial_startup_boot_worker, daemon=True).start()
 
         # Run daily at 2:00 PM Eastern Time
         eastern_tz = ZoneInfo("America/New_York")
         self.run_daily(self.fetch_and_import_utilityapi_data, "14:00:00", target_tz=eastern_tz)
 
-        # Run once on startup
+    def wait_for_mqtt(self, max_attempts=30, delay_seconds=5):
+        """Polls Home Assistant's MQTT service layer until it successfully accepts a service call."""
+        self.log("Polling Home Assistant to check if MQTT integration is online...")
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # Try a dummy ping to test the active broker connection socket
+                self.call_service("mqtt/publish", topic="utilityapi/status/ping", payload="ping", retain=False)
+                self.log("MQTT client connection established and validated successfully.")
+                return True
+            except Exception as e:
+                # Capture the "The client is not currently connected" or missing service integration errors
+                self.log(f"MQTT integration not fully ready yet (Attempt {attempt}/{max_attempts}). Retrying in {delay_seconds}s...")
+                time.sleep(delay_seconds)
+
+        self.error("Timed out waiting for Home Assistant's MQTT integration to become active.")
+        return False
+
+    def initial_startup_boot_worker(self):
+        """Executed shortly after startup to ensure dependencies like MQTT are fully online."""
+        """Background worker loop handling dependency verification and initial catch-up execution."""
+        # Block execution until MQTT responds successfully
+        if not self.wait_for_mqtt():
+            return
+
+        # 1. Now that MQTT broker connection is healthy, set up MQTT Discovery via HA Core to create the Device and Sensor(s) in EMQX
+        self.setup_mqtt_device()
+        # 2. Run historical data ingestion catchup
         self.fetch_and_import_utilityapi_data({})
 
     def setup_mqtt_device(self):
@@ -259,11 +293,20 @@ class UtilityAPIDataImporter(hass.Hass):
             last_sum = 0.0
             last_time_str = datetime.now(UTC) - timedelta(days=MAX_DAYS)
             self.log(f"Sensor entity '{entity_id}' could not be found or read. Using defaults: {last_sum}, {last_time_str}")
-             
+
         return last_sum, last_time_str
 
     def insert_statistics(self, ws, message_id, timestamp, cumulative_val, cfg):
         """Inserts LTS record dynamically using targeted metadata configurations."""
+
+        # Convert the typical "sensor.entity_name" to "utilityapi:entity_name"
+        # This is necessary because simply using "utilityapi:entity_name" in the sensor config dict breaks MQTT discovery
+        # Doing it this way enables split archictecture:
+        #      - sensor.entity_name enables MQTT discovery and is able to provide live-state (needed for sync bookmark for get_last_sync_info()) without implicitly injecting to historical records
+        #      - blahblah:entity_name enables external statistics for direct write to historical data, decoupled from live state behavior
+        # The decoupled external statistic prevents the Energy Dashboard from rendering phantom spikes due to live-state implicit updates
+        external_stat_id = cfg["entity_id"].replace("sensor.", f"{EXTERNAL_STAT_PREFIX}:")
+
         insert_message = json.dumps({
             "id": message_id,
             "type": "recorder/import_statistics",
@@ -271,8 +314,8 @@ class UtilityAPIDataImporter(hass.Hass):
                 "has_mean": True if cfg["device_class"] == "power" else False,
                 "has_sum": True if cfg["device_class"] == "energy" else False,
                 "name": cfg["name"],
-                "source": "recorder",
-                "statistic_id": cfg["entity_id"],
+                "source": EXTERNAL_STAT_PREFIX,
+                "statistic_id": external_stat_id,
                 "unit_of_measurement": cfg["unit"],
             },
             "stats": [{
@@ -284,7 +327,7 @@ class UtilityAPIDataImporter(hass.Hass):
         ws.send(insert_message)
         res = json.loads(ws.recv())
         if not res.get("success"):
-            self.error(f"LTS Insert error for {cfg['entity_id']} at {timestamp}: {res.get('error')}")
+            self.error(f"LTS Insert error for {external_stat_id} at {timestamp}: {res.get('error')}")
 
     def fetch_and_import_utilityapi_data(self, kwargs):
         # 1. Fetch UtilityAPI data
@@ -336,7 +379,7 @@ class UtilityAPIDataImporter(hass.Hass):
                         ts = datetime.fromisoformat(record.get("start")).astimezone(tz=UTC)
 
                         # Aggregate points into hourly buckets
-                        # if "cumulative" in sensor_key.lower(): 
+                        # if "cumulative" in sensor_key.lower():
                         #     ts = ts.replace(minute=0, second=0, microsecond=0)
                         ts = ts.replace(minute=0, second=0, microsecond=0) # HA long term statistics rigidly enforces hourly buckets
 
@@ -363,7 +406,7 @@ class UtilityAPIDataImporter(hass.Hass):
                 for ts in sorted_ts:
                     current_val = filtered_points[ts]
                     self.insert_statistics(ws, msg_id, ts, my_rounding_func(current_val), cfg)
-                    msg_id +=1 
+                    msg_id +=1
 
             # Update Home Assistant Entity Status via MQTT State & Attributes Topics
             attrs_payload = {f"{LAST_TIME_ATTR_STR}": last_high_res_time.isoformat()}
